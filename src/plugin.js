@@ -14,6 +14,8 @@ CKEDITOR.plugins.add('coops-ws', {
         this._selectionCheckPaused = false;
         this._currentColorProfileId = 0;
         this._currentColorProfileCount = 122;
+		this._pendingMessages = new Array();
+		this._socketOpen = false;
 
         editor.on("CoOPS:SessionStart", this._onSessionStart, this);
       },
@@ -21,14 +23,15 @@ CKEDITOR.plugins.add('coops-ws', {
         _handlePatchMessage : function(message) {
           var patch = message.patch;
           var revisionNumber = message.revisionNumber;
-          var clientId = message.clientId;
+          // var clientId = message.clientId;
+          var checksum = message.checksum;
 
           if (editor.fire("CoOPS:PatchReceived", {
-            patch : patch
+            patch : patch,
+            checksum: checksum
           })) {
             this._revisionNumber = revisionNumber;
-          }
-          ;
+          };
         },
 
         _cleanSelectionMarkers : function(clientId) {
@@ -207,7 +210,7 @@ CKEDITOR.plugins.add('coops-ws', {
         },
 
         _handleSelectionMessage : function(message) {
-          var revisionNumber = message.revisionNumber;
+          // var revisionNumber = message.revisionNumber;
           var clientId = message.clientId;
           var selections = message.selections;
 
@@ -225,40 +228,61 @@ CKEDITOR.plugins.add('coops-ws', {
             }, 0, this);
           }
         },
+        
+        _sendWebSocketMessage: function (message) {
+		  // TODO: Support for browsers without JSON support
+		  if (this._socketOpen) {
+            this._webSocket.send(JSON.stringify(message));
+		  } else {
+		    this._pendingMessages.push(message);
+		  }
+        },
 
         _onSessionStart : function(event) {
           var joinData = event.data.joinData;
 
           this._revisionNumber = event.data.revisionNumber;
-
-          this._webSocket = new WebSocket(joinData.webSocketUrl);
+          
+          this._webSocket = new (window.WebSocket || window.MozWebSocket)(joinData.webSocketUrl);
           this.getEditor().fire("CoOPS:WebSocketConnect");
 
-          var _this = this;
-          this._webSocket.onmessage = function(event) {
-            _this._onWebSocketMessage(event);
-          };
+          this._webSocket.onmessage = CKEDITOR.tools.bind(function (event) {
+            this._onWebSocketMessage(event);
+          }, this);
 
-          this._webSocket.onclose = function(event) {
-            _this._onWebSocketClose(event);
-          };
+          this._webSocket.onclose = CKEDITOR.tools.bind(function (event) {
+            this._socketOpen = false;
+            this._onWebSocketClose(event);
+          }, this);
+
+          this._webSocket.onopen = CKEDITOR.tools.bind(function (event) {
+            while (this._pendingMessages.length > 0) {
+              this._webSocket.send(JSON.stringify(this._pendingMessages.shift()));
+            }
+            
+            this._socketOpen = true;
+          }, this);
 
           this.getEditor().on("CoOPS:ContentPatch", this._onContentPatch, this);
-          this.getEditor().on("CoOPS:SelectionChange", this._onCoopsSelectionChange, this);
+          this.getEditor().on("CoOPS:ContentReverted", this._onContentReverted, this);
+
+          // this.getEditor().on("CoOPS:SelectionChange", this._onCoopsSelectionChange, this);
         },
 
         _onContentPatch : function(event) {
           var patch = event.data.patch;
-
-          var message = JSON.stringify({
+          
+          this.getEditor().getChangeObserver().pause();
+          
+          this._sendWebSocketMessage({
             type : 'patch',
             patch : patch,
             revisionNumber : this._revisionNumber
           });
-
-          this.getEditor().getChangeObserver().pause();
-
-          this._webSocket.send(message);
+        },
+        
+        _onContentReverted: function (event) {
+          this._revisionNumber = event.data.revisionNumber;
         },
 
         _onCoopsSelectionChange : function(event) {
@@ -273,13 +297,13 @@ CKEDITOR.plugins.add('coops-ws', {
               endContainerAddress : range.endContainer.getAddress(true),
               endOffset : range.endOffset
             });
-          }
-
-          this._webSocket.send(JSON.stringify({
+          };
+          
+          this._sendWebSocketMessage({
             type : 'selection',
             revisionNumber : this._revisionNumber,
             selections : selections
-          }));
+          });
         },
 
         _onWebSocketMessage : function(event) {
@@ -294,10 +318,14 @@ CKEDITOR.plugins.add('coops-ws', {
             break;
             case 'patchRejected':
               this.getEditor().getChangeObserver().resume();
+              this.getEditor().fire("CoOPS:PatchRejected");
             break;
             case 'patchAccepted':
               this._revisionNumber = message.revisionNumber;
               this.getEditor().getChangeObserver().resume();
+              this.getEditor().fire("CoOPS:PatchAccepted", {
+                revisionNumber: this._revisionNumber
+              });
             break;
           }
         },
